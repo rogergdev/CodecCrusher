@@ -2,7 +2,6 @@
 
 # 🎥 CodecCrusher - Transcodificación Automática con HandBrakeCLI y Notificaciones en Telegram
 
-![Logo de CodecCrusher](https://via.placeholder.com/728x90.png?text=CodecCrusher+Transcoder)  
 *¡Automatiza tu biblioteca multimedia como un profesional!*
 
 ---
