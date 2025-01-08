@@ -33,7 +33,7 @@ CodecCrusher es un potente script Bash que automatiza la transcodificación de a
 ✅ Transcodificación automática a H.265 utilizando HandBrakeCLI  
 ✅ Notificaciones en tiempo real a Telegram para actualizaciones de estado y errores  
 ✅ Base de datos SQLite para registrar el progreso de la transcodificación  
-✅ Monitoreo de carga del sistema y temperatura para evitar sobrecalentamientos  
+✅ Monitorización de carga del sistema y temperatura para evitar sobrecalentamientos  
 ✅ Rotación de logs y limpieza automática de archivos temporales  
 ✅ Informes diarios que resumen los resultados de la transcodificación y el espacio ahorrado  
 
@@ -51,7 +51,6 @@ CodecCrusher es un potente script Bash que automatiza la transcodificación de a
 📏 Tamaño original: 10 GB
 📏 Tamaño final: 5.2 GB
 📉 Ahorro: 48%
-🎙️ Idiomas: Inglés, Español, Francés
 ⏱ Tiempo transcurrido: 01:45:10
 ```
 
@@ -63,7 +62,7 @@ CodecCrusher es un potente script Bash que automatiza la transcodificación de a
 ❌ Error crítico: Archivo corrupto o no válido.
 📄 The.Matrix.1999.BluRay.mkv
 ```
-**Solución:** Revisa la integridad del archivo antes de intentar transcodificarlo nuevamente.
+**Solución:** Revisa la integridad del archivo antes de intentar transcodificarlo de nuevo.
 
 ### 🎥 Ejemplo 3: Archivo ya está en H.265
 **Archivo:** `Inception.2010.BluRay.mkv` (5.3 GB, H.265)
@@ -109,4 +108,4 @@ Este proyecto está licenciado bajo la Licencia MIT. Consulta el archivo [LICENS
 
 ---
 
-**Desarrollado con ❤️ por Roger.**
+**</> con ❤️ por Roger.**
