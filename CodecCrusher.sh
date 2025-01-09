@@ -3,10 +3,15 @@
 ##############################################################################
 # Ver el progreso:
 #   tail -f /home/roger/codeccrusher_logs/transcode.log
+#
+# Parar el servicio:
+#   sudo systemctl stop codeccrusher.service
 ##############################################################################
 
 # Cargar variables de entorno para Telegram (seguridad)
 source "$HOME/.codeccrusher_env"
+
+terminando=0  # Variable global para controlar la terminación
 
 # Directorios a escanear
 RUTAS=(
@@ -73,12 +78,18 @@ enviar_telegram() {
          -d text="${mensaje}" >/dev/null 2>&1
 }
 
+#--------------------- FUNCIÓN: obtener_codec_video ---------------------------
+obtener_codec_video() {
+    local archivo="$1"
+    ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+        -of default=noprint_wrappers=1:nokey=1 "$archivo" 2>/dev/null | tr '[:upper:]' '[:lower:]'
+}
+
 #--------------------- FUNCIÓN: obtener_temperatura ---------------------------
 obtener_temperatura() {
     local temp_c
 
-    # Intentar obtener la temperatura usando diferentes patrones
-    temp_c=$(sensors | awk '
+    temp_c=$(sensors 2>/dev/null | awk '
         /Core 0:/ {
             for(i=1;i<=NF;i++) {
                 if ($i ~ /\+?[0-9]+\.[0-9]+°C/) {
@@ -91,7 +102,7 @@ obtener_temperatura() {
     ')
 
     if [[ -z "$temp_c" || ! "$temp_c" =~ ^[0-9]+$ ]]; then
-        temp_c=$(sensors | awk '
+        temp_c=$(sensors 2>/dev/null | awk '
             /Package id 0:/ {
                 for(i=1;i<=NF;i++) {
                     if ($i ~ /\+?[0-9]+\.[0-9]+°C/) {
@@ -104,41 +115,70 @@ obtener_temperatura() {
         ')
     fi
 
-    if [[ -z "$temp_c" || ! "$temp_c" =~ ^[0-9]+$ ]]; then
-        echo "N/A"
-    else
-        echo "$temp_c"
-    fi
+    [[ -z "$temp_c" || ! "$temp_c" =~ ^[0-9]+$ ]] && temp_c="N/A"
+
+    echo "$temp_c"
 }
 
 #--------------------- FUNCIÓN: registrar_transcodificado ---------------------
 registrar_transcodificado() {
-    local archivo="$1"
+    local archivo_original="$1"
     local estado="$2"
     local fecha
     fecha=$(date '+%Y-%m-%d %H:%M:%S')
 
+    local size_original=0
+    if [[ -f "$archivo_original" ]]; then
+        size_original=$(stat -c%s "$archivo_original" 2>/dev/null)
+    fi
+
+    local archivo_transcodificado="${archivo_original%.*}.mkv"
+
+    local size_final=0
+    if [[ -f "$archivo_transcodificado" ]]; then
+        size_final=$(stat -c%s "$archivo_transcodificado" 2>/dev/null)
+    fi
+
     sqlite3 "$DB_FILE" <<EOF
 CREATE TABLE IF NOT EXISTS transcodificados (
     archivo TEXT PRIMARY KEY,
+    original_archivo TEXT,
+    archivo_transcodificado TEXT,
     fecha_transcodificacion TEXT,
-    estado TEXT
+    estado TEXT,
+    size_original INTEGER DEFAULT 0,
+    size_final INTEGER DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_archivo ON transcodificados (archivo);
+CREATE INDEX IF NOT EXISTS idx_original_archivo ON transcodificados (original_archivo);
 EOF
 
     sqlite3 "$DB_FILE" <<EOF
-INSERT INTO transcodificados (archivo, fecha_transcodificacion, estado)
-VALUES ('$archivo', '$fecha', '$estado')
-ON CONFLICT(archivo) DO UPDATE SET fecha_transcodificacion='$fecha', estado='$estado';
+INSERT INTO transcodificados (
+    archivo,
+    original_archivo,
+    archivo_transcodificado,
+    fecha_transcodificacion,
+    estado,
+    size_original,
+    size_final
+)
+VALUES (
+    '$archivo_original',
+    '$archivo_original',
+    '$archivo_transcodificado',
+    '$fecha',
+    '$estado',
+    $size_original,
+    $size_final
+)
+ON CONFLICT(archivo) DO UPDATE SET
+    original_archivo='$archivo_original',
+    archivo_transcodificado='$archivo_transcodificado',
+    fecha_transcodificacion='$fecha',
+    estado='$estado',
+    size_original=$size_original,
+    size_final=$size_final;
 EOF
-}
-
-#--------------------- FUNCIÓN: obtener_codec_video --------------------------
-obtener_codec_video() {
-    local archivo="$1"
-    ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
-        -of default=noprint_wrappers=1:nokey=1 "$archivo" | tr '[:upper:]' '[:lower:]'
 }
 
 #--------------------- FUNCIÓN: obtener_bitrate_video -------------------------
@@ -146,16 +186,22 @@ obtener_bitrate_video() {
     local archivo="$1"
     local bitrate
     bitrate=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate \
-        -of default=noprint_wrappers=1:nokey=1 "$archivo")
+        -of default=noprint_wrappers=1:nokey=1 "$archivo" 2>/dev/null)
+
     if [[ -z "$bitrate" || "$bitrate" == "N/A" ]]; then
         local size_bytes duration_sec
         size_bytes=$(stat -c%s "$archivo")
         duration_sec=$(ffprobe -v error -select_streams v:0 -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 "$archivo")
-        bitrate=$(echo "scale=0; ($size_bytes * 8) / ($duration_sec * 1000)" | bc -l)
+            -of default=noprint_wrappers=1:nokey=1 "$archivo" 2>/dev/null)
+        if [[ -n "$duration_sec" && "$duration_sec" =~ ^[0-9.]+$ ]]; then
+            bitrate=$(echo "scale=0; ($size_bytes * 8) / ($duration_sec * 1000)" | bc -l)
+        else
+            bitrate=0
+        fi
     else
         bitrate=$(echo "scale=0; $bitrate / 1000" | bc)
     fi
+
     echo "$bitrate"
 }
 
@@ -165,37 +211,34 @@ obtener_idiomas_y_subtitulos() {
     local idiomas=""
     local subtitulos=""
 
-    # Obtener pistas de audio
+    # Pistas de audio
     while IFS= read -r linea; do
         local lang=$(echo "$linea" | grep -oP 'language=\K\w+')
         local title=$(echo "$linea" | grep -oP 'title=\K[^,]*')
-
         if [[ -n "$title" ]]; then
             idiomas+="$title ($lang), "
         else
             idiomas+="$lang, "
         fi
-    done < <(ffprobe -v error -select_streams a -show_entries stream=index:stream_tags=language,title -of default=noprint_wrappers=1:nokey=1 "$archivo")
+    done < <(ffprobe -v error -select_streams a -show_entries stream=index:stream_tags=language,title \
+             -of default=noprint_wrappers=1:nokey=1 "$archivo" 2>/dev/null)
 
-    # Obtener pistas de subtítulos
+    # Pistas de subtítulos
     while IFS= read -r linea; do
         local lang=$(echo "$linea" | grep -oP 'language=\K\w+')
         local title=$(echo "$linea" | grep -oP 'title=\K[^,]*')
-
         if [[ -n "$title" ]]; then
             subtitulos+="$title ($lang), "
         else
             subtitulos+="$lang, "
         fi
-    done < <(ffprobe -v error -select_streams s -show_entries stream=index:stream_tags=language,title -of default=noprint_wrappers=1:nokey=1 "$archivo")
+    done < <(ffprobe -v error -select_streams s -show_entries stream=index:stream_tags=language,title \
+             -of default=noprint_wrappers=1:nokey=1 "$archivo" 2>/dev/null)
 
-    # Limpiar las comas finales
     idiomas=${idiomas%, }
     subtitulos=${subtitulos%, }
-
-    # Valores por defecto si no hay pistas detectadas
-    [ -z "$idiomas" ] && idiomas="Desconocido"
-    [ -z "$subtitulos" ] && subtitulos="Desconocido"
+    [[ -z "$idiomas" ]] && idiomas="Desconocido"
+    [[ -z "$subtitulos" ]] && subtitulos="Desconocido"
 
     echo "$idiomas|$subtitulos"
 }
@@ -203,9 +246,9 @@ obtener_idiomas_y_subtitulos() {
 #--------------------- FUNCIÓN: cargar_transcodificados -----------------------
 cargar_transcodificados() {
     declare -A transcodificados_map
-    while IFS= read -r archivo; do
-        transcodificados_map["$archivo"]=1
-    done < <(sqlite3 "$DB_FILE" "SELECT archivo FROM transcodificados WHERE estado='completado';")
+    while IFS= read -r archivo_original; do
+        [[ -n "$archivo_original" ]] && transcodificados_map["$archivo_original"]=1
+    done < <(sqlite3 "$DB_FILE" "SELECT original_archivo FROM transcodificados WHERE estado='completado';")
     echo "${!transcodificados_map[@]}"
 }
 
@@ -263,9 +306,11 @@ monitorear_temperatura() {
 
 #--------------------- FUNCIÓN: verificar_espacio ----------------------------
 verificar_espacio() {
-    local archivo="$1" partition free_gb
+    local archivo="$1"
+    local partition free_gb
     partition=$(df -P "$archivo" | tail -1 | awk '{print $1}')
     free_gb=$(df -BG "$archivo" | tail -1 | awk '{print $4}' | sed 's/G//')
+
     if [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
         enviar_telegram "⚠️ *Espacio insuficiente* (~${free_gb}GB, min: ${MIN_FREE_GB}GB)."
         echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Espacio insuficiente en $partition => $free_gb GB" >> "$LOG_FILE"
@@ -286,7 +331,6 @@ smartctl_check() {
         fi
     done
 
-    # Enviar temperatura después del SMART Check
     local temp_c
     temp_c=$(obtener_temperatura)
     if [[ "$temp_c" != "N/A" ]]; then
@@ -300,7 +344,9 @@ smartctl_check() {
 rotar_log() {
     local max_log_size=10485760
     local log_backup_dir="$BACKUP_DIR"
+
     [ ! -d "$log_backup_dir" ] && mkdir -p "$log_backup_dir"
+
     if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE") -gt $max_log_size ]; then
         local timestamp backup_file
         timestamp=$(date '+%Y%m%d_%H%M%S')
@@ -310,108 +356,103 @@ rotar_log() {
         touch "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Log rotado a $backup_file" >> "$LOG_FILE"
     fi
+
     find "$log_backup_dir" -type f -name "transcode_*.log" -mtime +30 -exec rm -f {} \;
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Limpieza de logs completada" >> "$LOG_FILE"
 }
 
 #--------------------- FUNCIÓN: transcodificar -------------------------------
 transcodificar() {
-    local archivo="$1"
-    local tmp="${archivo%.*}_temp.mkv"
+    local archivo_original="$1"
+    local tmp="${archivo_original%.*}_temp.mkv"
 
-    # Capturar el PID del proceso actual para manejo de señales
-    trap "interrumpir_transcodificacion '$archivo' '$tmp'" SIGINT SIGTERM
+    trap "interrumpir_transcodificacion '$archivo_original' '$tmp'" SIGINT SIGTERM
 
     local codec bitrate
-    codec=$(obtener_codec_video "$archivo")
+    codec=$(obtener_codec_video "$archivo_original")
+
+    # Si es HEVC, consideramos que está OK y no se transcodifica
     if [[ "$codec" == "hevc" ]]; then
-        registrar_transcodificado "$archivo" "completado"
+        registrar_transcodificado "$archivo_original" "completado"
         return
+    # Si no es h264/hevc, saltamos la transcodificación
     elif [[ "$codec" != "h264" ]]; then
-        enviar_telegram "ℹ️ No H.264/H.265: $(basename "$archivo")"
-        registrar_transcodificado "$archivo" "saltado_no_h264_hevc"
+        # ----> COMENTAMOS ESTA LÍNEA PARA EVITAR SPAM AL INICIAR <----
+        # enviar_telegram "ℹ️ No H.264/H.265: $(basename "$archivo_original")"
+        registrar_transcodificado "$archivo_original" "saltado_no_h264_hevc"
         return
     fi
 
-    bitrate=$(obtener_bitrate_video "$archivo")
+    bitrate=$(obtener_bitrate_video "$archivo_original")
     if [ "$bitrate" -le "$MAX_BITRATE_H264" ]; then
-        enviar_telegram "ℹ️ Optimizado: $(basename "$archivo") - ${bitrate} kbps"
-        registrar_transcodificado "$archivo" "completado"
+        # Suprimimos la notificación de "Optimizado"
+        registrar_transcodificado "$archivo_original" "completado"
         return
     fi
 
-    local size_bytes size_gb est_size_gb
-    size_bytes=$(stat -c%s "$archivo")
+    local size_bytes size_gb
+    size_bytes=$(stat -c%s "$archivo_original")
     size_gb=$(awk "BEGIN {printf \"%.2f\", $size_bytes/1073741824}")
 
-    # Cálculo del tamaño estimado (bitrate objetivo de 2200 kbps)
-    # local duration
-    # duration=$(ffprobe -v error -select_streams v:0 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$archivo")
-    # est_size_gb=$(awk "BEGIN {printf \"%.2f\", ($duration * 2200 * 1000) / 8 / 1073741824}")
-
-    # Obtener el nombre del disco basado en la ruta del archivo
+    local disco=""
     for ruta in "${RUTAS[@]}"; do
-        if [[ "$archivo" == $ruta/* ]]; then
+        if [[ "$archivo_original" == $ruta/* ]]; then
             disco="${discos[$ruta]}"
             break
         fi
     done
 
+    local start_time
+    start_time=$(date +%s)
+    enviar_telegram "🎬 Transcodificando:\n🖥️ $disco\n📄 $(basename "$archivo_original")"
 
-    # Tiempo de inicio
-    local start_time=$(date +%s)
-
-    enviar_telegram "🎬 Transcodificando:\n🖥️ $disco\n📄 $(basename "$archivo")"
-    #\n📏Tamaño estimado: ${est_size_gb} GB"
-
-    verificar_espacio "$archivo" || return
+    verificar_espacio "$archivo_original" || return
 
     local idiomas_subs idiomas subtitulos
-    idiomas_subs=$(obtener_idiomas_y_subtitulos "$archivo")
+    idiomas_subs=$(obtener_idiomas_y_subtitulos "$archivo_original")
     idiomas=$(echo "$idiomas_subs" | cut -d '|' -f1)
     subtitulos=$(echo "$idiomas_subs" | cut -d '|' -f2)
 
-    registrar_transcodificado "$archivo" "en proceso"
-    local intentos=0 max_intentos=3
+    registrar_transcodificado "$archivo_original" "en proceso"
+    local intentos=0
+    local max_intentos=3
 
     while [ $intentos -lt $max_intentos ]; do
-    nice -n 19 ionice -c3 HandBrakeCLI \
-        --input "$archivo" \
-        --output "$tmp" \
-        --encoder x265 \
-        --quality "$RF" \
-        --preset="$PRESET" \
-        --x265-preset="$SPEED" \
-        --optimize \
-        --all-audio \
-        --aencoder "copy" \
-        --audio-copy-mask "aac,ac3,dts,eac3,truehd" \
-        --audio-fallback "av_aac" \
-        --all-subtitles \
-        < /dev/null >> "$LOG_FILE" 2>&1
+        nice -n 19 ionice -c3 HandBrakeCLI \
+            --input "$archivo_original" \
+            --output "$tmp" \
+            --encoder x265 \
+            --quality "$RF" \
+            --preset="$PRESET" \
+            --x265-preset="$SPEED" \
+            --optimize \
+            --all-audio \
+            --aencoder "copy" \
+            --audio-copy-mask "aac,ac3,dts,eac3,truehd" \
+            --audio-fallback "av_aac" \
+            --all-subtitles \
+            < /dev/null >> "$LOG_FILE" 2>&1
 
         if [ $? -eq 0 ] && [ -f "$tmp" ]; then
-            mv "$tmp" "${archivo%.*}.mkv"
+            mv "$tmp" "${archivo_original%.*}.mkv"
             local final_bytes final_gb ahorro
-            final_bytes=$(stat -c%s "${archivo%.*}.mkv")
+            final_bytes=$(stat -c%s "${archivo_original%.*}.mkv")
             final_gb=$(awk "BEGIN {printf \"%.2f\", $final_bytes/1073741824}")
             ahorro=$(( (size_gb - final_gb) * 100 / size_gb ))
 
-            # Tiempo de fin
-            local end_time=$(date +%s)
+            local end_time
+            end_time=$(date +%s)
             local duration=$((end_time - start_time))
-
-            # Convertir tiempo a formato legible
             local hours=$((duration / 3600))
             local minutes=$(( (duration % 3600) / 60 ))
             local seconds=$((duration % 60))
-            local tiempo_transcurrido=$(printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds")
+            local tiempo_transcurrido
+            tiempo_transcurrido=$(printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds")
 
-            enviar_telegram "✅ Transcodificación completada:\n📄 $(basename "${archivo%.*}.mkv")\n📏 Tamaño original: ${size_gb} GB\n📏 Tamaño final: ${final_gb} GB\n📉 Ahorro: ${ahorro}%\n⏱ Tiempo transcurrido: ${tiempo_transcurrido}"
-            registrar_transcodificado "${archivo%.*}.mkv" "completado"
+            enviar_telegram "✅ Transcodificación completada:\n📄 $(basename "${archivo_original%.*}.mkv")\n📏 Tamaño original: ${size_gb} GB\n📏 Tamaño final: ${final_gb} GB\n📉 Ahorro: ${ahorro}%\n⏱ Tiempo transcurrido: ${tiempo_transcurrido}"
+            registrar_transcodificado "$archivo_original" "completado"
             limpiar_temporal "$tmp"
             
-             # Enviar temperatura tras la transcodificación
             local temp_c
             temp_c=$(obtener_temperatura)
             if [[ "$temp_c" != "N/A" ]]; then
@@ -424,12 +465,12 @@ transcodificar() {
         fi
 
         intentos=$((intentos + 1))
-        enviar_telegram "🔄 Reintento $intentos de $max_intentos: $(basename "$archivo")"
+        enviar_telegram "🔄 Reintento $intentos de $max_intentos: $(basename "$archivo_original")"
         sleep $((intentos * 10))
     done
 
-    enviar_telegram "❌ Fallo crítico en: $(basename "$archivo") tras $max_intentos intentos."
-    registrar_transcodificado "$archivo" "fallido_permanente"
+    enviar_telegram "❌ Fallo crítico en: $(basename "$archivo_original") tras $max_intentos intentos."
+    registrar_transcodificado "$archivo_original" "fallido_permanente"
     limpiar_temporal "$tmp"
 }
 
@@ -453,23 +494,23 @@ interrumpir_transcodificacion() {
 procesar_archivos() {
     local archivos_pendientes=0
     declare -A transcodificados_map
-    while IFS= read -r archivo; do
-        transcodificados_map["$archivo"]=1
+    while IFS= read -r archivo_original; do
+        [[ -n "$archivo_original" ]] && transcodificados_map["$archivo_original"]=1
     done < <(cargar_transcodificados)
 
     for ruta in "${RUTAS[@]}"; do
         find "$ruta" -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" \) \
-             ! -iname "*_temp.*" -print0 | while IFS= read -r -d '' archivo; do
-            if [[ ${transcodificados_map["$archivo"]+exists} ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Archivo ya transcodificado: $archivo" >> "$LOG_FILE"
+             ! -iname "*_temp.*" -print0 | while IFS= read -r -d '' archivo_original; do
+            if [[ ${transcodificados_map["$archivo_original"]+exists} ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Archivo ya transcodificado: $archivo_original" >> "$LOG_FILE"
                 continue
             fi
-            if ! verificar_espacio "$archivo"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Espacio insuficiente para: $archivo" >> "$LOG_FILE"
+            if ! verificar_espacio "$archivo_original"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Espacio insuficiente para: $archivo_original" >> "$LOG_FILE"
                 continue
             fi
             archivos_pendientes=$((archivos_pendientes + 1))
-            transcodificar "$archivo"
+            transcodificar "$archivo_original"
         done
     done
 
@@ -488,6 +529,11 @@ limpiar_archivos_temporales() {
 
 #--------------------- FUNCIÓN: manejador_senal -------------------------------
 manejador_senal() {
+    if [ "$terminando" == "1" ]; then
+        exit 0
+    fi
+    terminando=1
+
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Señal de terminación recibida. Finalizando..." >> "$LOG_FILE"
     enviar_telegram "🔴 *CodecCrusher detenido.*"
     rm -f "$LOCKFILE"
@@ -510,54 +556,53 @@ EOF
 
 #--------------------- FUNCIÓN: enviar_informe_diario -------------------------
 enviar_informe_diario() {
-    local fecha_actual
-    fecha_actual=$(date '+%Y-%m-%d %H:%M:%S')  # Fecha en formato original para la consulta
-
-    # Obtener estadísticas de la base de datos
     local archivos_transcodificados
-    archivos_transcodificados=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM transcodificados WHERE estado='completado' AND DATE(fecha_transcodificacion) = DATE('now', 'localtime');")
+    archivos_transcodificados=$(sqlite3 "$DB_FILE" "
+        SELECT COUNT(*) FROM transcodificados 
+        WHERE estado='completado' 
+          AND DATE(fecha_transcodificacion) = DATE('now', 'localtime');
+    ")
 
-    # Calcular tamaños de archivos
-    local espacio_original espacio_final
-    espacio_original=0
-    espacio_final=0
+    local sum_sizes_query="
+        SELECT 
+            IFNULL(SUM(size_original), 0), 
+            IFNULL(SUM(size_final), 0) 
+        FROM transcodificados 
+        WHERE estado='completado' 
+          AND DATE(fecha_transcodificacion) = DATE('now', 'localtime');
+    "
 
-    while IFS='|' read -r archivo fecha estado; do
-        if [[ "$estado" == "completado" && -f "$archivo" ]]; then
-            if original_size=$(stat --format="%s" "$archivo" 2>/dev/null || stat -f "%z" "$archivo" 2>/dev/null) && \
-               final_size=$(stat --format="%s" "${archivo%.*}.mkv" 2>/dev/null || stat -f "%z" "${archivo%.*}.mkv" 2>/dev/null); then
-                espacio_original=$((espacio_original + original_size))
-                espacio_final=$((espacio_final + final_size))
-            else
-                echo "⚠️ Archivo no encontrado: $archivo" >> "$LOG_FILE"
-            fi
-        fi
-    done < <(sqlite3 "$DB_FILE" "SELECT archivo, fecha_transcodificacion, estado FROM transcodificados WHERE DATE(fecha_transcodificacion) = DATE('now', 'localtime');")
+    IFS='|' read -r espacio_original espacio_final <<< "$(sqlite3 "$DB_FILE" "$sum_sizes_query")"
 
-    # Verificar si se han encontrado archivos para evitar división por cero
     if (( espacio_original == 0 )); then
-        enviar_telegram "📋 *Informe Diario:* No se encontraron transcodificaciones completadas hoy."
+        enviar_telegram "📊 *Informe diario*\n🗓️ Fecha: $(date '+%d/%m/%Y %H:%M:%S')\n✅ No se encontraron transcodificaciones completadas hoy."
         return
     fi
 
-    # Convertir a GB
-    espacio_original=$(awk "BEGIN { printf \"%.2f\", $espacio_original / 1073741824 }")
-    espacio_final=$(awk "BEGIN { printf \"%.2f\", $espacio_final / 1073741824 }")
+    local orig_gb
+    orig_gb=$(awk "BEGIN { printf \"%.2f\", $espacio_original / 1073741824 }")
+    local final_gb
+    final_gb=$(awk "BEGIN { printf \"%.2f\", $espacio_final / 1073741824 }")
+    local ahorrado_gb
+    ahorrado_gb=$(awk "BEGIN { printf \"%.2f\", ($espacio_original - $espacio_final) / 1073741824 }")
 
-    # Calcular ahorro
-    local espacio_ahorrado ahorro_total
-    espacio_ahorrado=$(awk "BEGIN { printf \"%.2f\", $espacio_original - $espacio_final }")
-    ahorro_total=$(awk "BEGIN { printf \"%.2f\", ($espacio_ahorrado > 0 ? ($espacio_ahorrado / $espacio_original) * 100 : 0) }")
+    local ahorro_total
+    ahorro_total=$(awk "BEGIN {
+        if ($espacio_original > 0) {
+            printf \"%.2f\", (($espacio_original - $espacio_final) / $espacio_original) * 100
+        } else {
+            print \"0.00\"
+        }
+    }")
 
-    # Convertir la fecha al formato español (DD/MM/YYYY)
-    local fecha_formato_espana
-    fecha_formato_espana=$(date -d "$fecha_actual" '+%d/%m/%Y')
+    local informe="📊 *Informe diario*\n"
+    informe+="🗓️ Fecha: $(date '+%d/%m/%Y %H:%M:%S')\n"
+    informe+="✅ Archivos transcodificados hoy: ${archivos_transcodificados}\n"
+    informe+="📏 Tamaño original total: ${orig_gb} GB\n"
+    informe+="📏 Tamaño final total: ${final_gb} GB\n"
+    informe+="💾 Espacio ahorrado: ${ahorrado_gb} GB\n"
+    informe+="🔻 Ahorro total: ${ahorro_total}%"
 
-    # Concatenar todo el informe en una sola variable
-    local informe
-    informe="📊 *Informe diario de CodecCrusher*\n\n📅 *Fecha:* ${fecha_formato_espana}\n✅ *Archivos transcodificados:* ${archivos_transcodificados}\n💾 *Espacio total ahorrado:* ${espacio_ahorrado} GB\n📏 *Tamaño original:* ${espacio_original} GB\n📉 *Tamaño final:* ${espacio_final} GB\n🔻 *Ahorro total:* ${ahorro_total}%"
-
-    # Enviar el informe completo en un solo mensaje
     enviar_telegram "$informe"
 }
 
@@ -572,7 +617,6 @@ programar_informe_diario() {
     done
 }
 
-
 #--------------------- MAIN LOOP -------------------------------
 main() {
     enviar_telegram "🟢 *CodecCrusher iniciado.*"
@@ -580,7 +624,6 @@ main() {
     limpiar_logs_antiguos
     limpiar_archivos_temporales
 
-    # Programar el informe diario
     programar_informe_diario &
 
     while true; do
@@ -607,7 +650,7 @@ if [ -e "$LOCKFILE" ] && kill -0 "$(cat "$LOCKFILE")" &>/dev/null; then
 fi
 
 echo $$ > "$LOCKFILE"
-trap manejador_senal SIGINT SIGTERM EXIT
+trap manejador_senal SIGINT SIGTERM
 
 case "$1" in
     run)
