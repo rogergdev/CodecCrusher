@@ -2,7 +2,7 @@
 
 ##############################################################################
 # Ver el progreso:
-#   tail -f /home/roger/codeccrusher_logs/transcode.log
+#   tail -f /home/tranquilamami/codeccrusher_logs/transcode.log
 #
 # Parar el servicio:
 #   sudo systemctl stop codeccrusher.service
@@ -13,32 +13,58 @@ source "$HOME/.codeccrusher_env"
 
 terminando=0  # Variable global para controlar la terminación
 
+##############################################################################
+# AJUSTES DE RUTAS Y PARÁMETROS
+##############################################################################
 # Directorios a escanear
 RUTAS=(
-    "/media/roger/Disco1"
-    "/media/roger/Disco3"
-    "/media/roger/Disco4"
+    "/media/tranquilamami/Disco1"
+    "/media/tranquilamami/Disco3"
+    "/media/tranquilamami/Disco4"
     "/mnt/D10TB"
 )
 
 # Mapeo de las rutas a los discos
 declare -A discos
 discos=(
-    ["/media/roger/Disco1"]="Disco 1"
-    ["/media/roger/Disco3"]="Disco 3"
-    ["/media/roger/Disco4"]="Disco 4"
+    ["/media/tranquilamami/Disco1"]="Disco 1"
+    ["/media/tranquilamami/Disco3"]="Disco 3"
+    ["/media/tranquilamami/Disco4"]="Disco 4"
     ["/mnt/D10TB"]="D10TB"
 )
 
 EXTENSIONES=("mp4" "mkv" "avi" "mov")
 
-# Configuración de HandBrakeCLI y parámetros
+##############################################################################
+# CONFIGURACIÓN DE HANDBRAKE (Flatpak) y PARÁMETROS X265
+##############################################################################
+# Usa la versión 1.9.0 de HandBrake instalada vía Flatpak con la ID: fr.handbrake.HandBrakeCLI
+FLATPAK_HANDBRAKE="flatpak run fr.handbrake.HandBrakeCLI"
+
+# Parámetros base de HandBrake (no confundir con x265-preset):
 PRESET="Fast 1080p30"
+
+# Valor CRF (RF): a menor valor, mejor calidad pero mayor tamaño
 RF=21
+
+##############################################################################
+# ⚖️ RESUMEN RÁPIDO SOBRE LOS PRESETS DE x265:
+# - medium: ✅ Más rápido, pero genera archivos un poco más grandes.
+# - slow: 🚀 Más lento, pero ofrece mejor compresión (archivos más pequeños).
+#
+# 🔧 RECOMENDACIÓN PERSONAL:
+# Mantener el preset en "slow" para maximizar el ahorro de espacio en disco,
+# sin comprometer la calidad visual. Cambiar a "medium" solo si la velocidad
+# de codificación es una prioridad.
+#
+# x265 preset => "slow" da mejor compresión (menos tamaño) que "medium"
+##############################################################################
 SPEED="medium"
+
 DEFAULT_SAMPLE_RATE=48000
 DEFAULT_CHANNELS=2
 DEFAULT_BITRATE=192000
+
 MIN_FREE_GB=5
 TEMPERATURA_UMBRAL=85
 MAX_BITRATE_H264=2000
@@ -50,9 +76,13 @@ BACKUP_DIR="$HOME/codeccrusher_backup"
 LOG_FILE="$LOG_DIR/transcode.log"
 LOCKFILE="$LOG_DIR/codeccrusher.lock"
 
+##############################################################################
+# FUNCIONES
+##############################################################################
+
 #--------------------- FUNCIÓN: verificar_dependencias -------------------------
 verificar_dependencias() {
-    local dependencias=("HandBrakeCLI" "ffmpeg" "ffprobe" "sqlite3" "smartctl" "sensors" "curl" "bc" "awk" "sed" "grep" "find" "du" "stat" "nice" "ionice")
+    local dependencias=("flatpak" "ffmpeg" "ffprobe" "sqlite3" "smartctl" "sensors" "curl" "bc" "awk" "sed" "grep" "find" "du" "stat" "nice" "ionice")
     local faltantes=()
 
     for cmd in "${dependencias[@]}"; do
@@ -88,7 +118,6 @@ obtener_codec_video() {
 #--------------------- FUNCIÓN: obtener_temperatura ---------------------------
 obtener_temperatura() {
     local temp_c
-
     temp_c=$(sensors 2>/dev/null | awk '
         /Core 0:/ {
             for(i=1;i<=NF;i++) {
@@ -116,7 +145,6 @@ obtener_temperatura() {
     fi
 
     [[ -z "$temp_c" || ! "$temp_c" =~ ^[0-9]+$ ]] && temp_c="N/A"
-
     echo "$temp_c"
 }
 
@@ -128,16 +156,11 @@ registrar_transcodificado() {
     fecha=$(date '+%Y-%m-%d %H:%M:%S')
 
     local size_original=0
-    if [[ -f "$archivo_original" ]]; then
-        size_original=$(stat -c%s "$archivo_original" 2>/dev/null)
-    fi
+    [[ -f "$archivo_original" ]] && size_original=$(stat -c%s "$archivo_original" 2>/dev/null)
 
     local archivo_transcodificado="${archivo_original%.*}.mkv"
-
     local size_final=0
-    if [[ -f "$archivo_transcodificado" ]]; then
-        size_final=$(stat -c%s "$archivo_transcodificado" 2>/dev/null)
-    fi
+    [[ -f "$archivo_transcodificado" ]] && size_final=$(stat -c%s "$archivo_transcodificado" 2>/dev/null)
 
     sqlite3 "$DB_FILE" <<EOF
 CREATE TABLE IF NOT EXISTS transcodificados (
@@ -211,27 +234,17 @@ obtener_idiomas_y_subtitulos() {
     local idiomas=""
     local subtitulos=""
 
-    # Pistas de audio
     while IFS= read -r linea; do
         local lang=$(echo "$linea" | grep -oP 'language=\K\w+')
         local title=$(echo "$linea" | grep -oP 'title=\K[^,]*')
-        if [[ -n "$title" ]]; then
-            idiomas+="$title ($lang), "
-        else
-            idiomas+="$lang, "
-        fi
+        [[ -n "$title" ]] && idiomas+="$title ($lang), " || idiomas+="$lang, "
     done < <(ffprobe -v error -select_streams a -show_entries stream=index:stream_tags=language,title \
              -of default=noprint_wrappers=1:nokey=1 "$archivo" 2>/dev/null)
 
-    # Pistas de subtítulos
     while IFS= read -r linea; do
         local lang=$(echo "$linea" | grep -oP 'language=\K\w+')
         local title=$(echo "$linea" | grep -oP 'title=\K[^,]*')
-        if [[ -n "$title" ]]; then
-            subtitulos+="$title ($lang), "
-        else
-            subtitulos+="$lang, "
-        fi
+        [[ -n "$title" ]] && subtitulos+="$title ($lang), " || subtitulos+="$lang, "
     done < <(ffprobe -v error -select_streams s -show_entries stream=index:stream_tags=language,title \
              -of default=noprint_wrappers=1:nokey=1 "$archivo" 2>/dev/null)
 
@@ -344,7 +357,6 @@ smartctl_check() {
 rotar_log() {
     local max_log_size=10485760
     local log_backup_dir="$BACKUP_DIR"
-
     [ ! -d "$log_backup_dir" ] && mkdir -p "$log_backup_dir"
 
     if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE") -gt $max_log_size ]; then
@@ -371,13 +383,12 @@ transcodificar() {
     local codec bitrate
     codec=$(obtener_codec_video "$archivo_original")
 
-    # Si es HEVC, consideramos que está OK y no se transcodifica
+    # Si es HEVC, lo consideramos ya óptimo
     if [[ "$codec" == "hevc" ]]; then
         registrar_transcodificado "$archivo_original" "completado"
         return
-    # Si no es h264/hevc, saltamos la transcodificación
     elif [[ "$codec" != "h264" ]]; then
-        # ----> COMENTAMOS ESTA LÍNEA PARA EVITAR SPAM AL INICIAR <----
+        # Comentado para evitar spam
         # enviar_telegram "ℹ️ No H.264/H.265: $(basename "$archivo_original")"
         registrar_transcodificado "$archivo_original" "saltado_no_h264_hevc"
         return
@@ -385,7 +396,8 @@ transcodificar() {
 
     bitrate=$(obtener_bitrate_video "$archivo_original")
     if [ "$bitrate" -le "$MAX_BITRATE_H264" ]; then
-        # Suprimimos la notificación de "Optimizado"
+        # Comentado para evitar spam de "Optimizado"
+        # enviar_telegram "ℹ️ Optimizado: $(basename "$archivo_original") - ${bitrate} kbps"
         registrar_transcodificado "$archivo_original" "completado"
         return
     fi
@@ -414,11 +426,17 @@ transcodificar() {
     subtitulos=$(echo "$idiomas_subs" | cut -d '|' -f2)
 
     registrar_transcodificado "$archivo_original" "en proceso"
+
     local intentos=0
     local max_intentos=3
 
+    # Sin tune=animation ni advanced flags, para total compatibilidad.
+    local X265_OPTS=""
+    local TWO_PASS_OPTS=""
+
     while [ $intentos -lt $max_intentos ]; do
-        nice -n 19 ionice -c3 HandBrakeCLI \
+        nice -n 19 ionice -c3 \
+        $FLATPAK_HANDBRAKE \
             --input "$archivo_original" \
             --output "$tmp" \
             --encoder x265 \
@@ -426,6 +444,8 @@ transcodificar() {
             --preset="$PRESET" \
             --x265-preset="$SPEED" \
             --optimize \
+            $X265_OPTS \
+            $TWO_PASS_OPTS \
             --all-audio \
             --aencoder "copy" \
             --audio-copy-mask "aac,ac3,dts,eac3,truehd" \
@@ -534,9 +554,18 @@ manejador_senal() {
     fi
     terminando=1
 
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Señal de terminación recibida. Finalizando..." >> "$LOG_FILE"
+    # Notificación de detención a Telegram
     enviar_telegram "🔴 *CodecCrusher detenido.*"
+
+    # Terminar HandBrakeCLI ejecutado con Flatpak
+    flatpak kill fr.handbrake.HandBrakeCLI
+
+    # Matar todos los procesos hijos
+    pkill -P $$
+
+    # Eliminar el archivo LOCKFILE
     rm -f "$LOCKFILE"
+
     exit 0
 }
 
@@ -558,34 +587,39 @@ EOF
 enviar_informe_diario() {
     local archivos_transcodificados
     archivos_transcodificados=$(sqlite3 "$DB_FILE" "
-        SELECT COUNT(*) FROM transcodificados 
-        WHERE estado='completado' 
+        SELECT COUNT(*) FROM transcodificados
+        WHERE estado='completado'
           AND DATE(fecha_transcodificacion) = DATE('now', 'localtime');
     ")
 
     local sum_sizes_query="
-        SELECT 
-            IFNULL(SUM(size_original), 0), 
-            IFNULL(SUM(size_final), 0) 
-        FROM transcodificados 
-        WHERE estado='completado' 
+        SELECT
+            IFNULL(SUM(size_original), 0),
+            IFNULL(SUM(size_final), 0)
+        FROM transcodificados
+        WHERE estado='completado'
           AND DATE(fecha_transcodificacion) = DATE('now', 'localtime');
     "
 
     IFS='|' read -r espacio_original espacio_final <<< "$(sqlite3 "$DB_FILE" "$sum_sizes_query")"
 
+    # Si no hubo transcodificaciones (espacio_original = 0), avisamos y salimos
     if (( espacio_original == 0 )); then
         enviar_telegram "📊 *Informe diario*\n🗓️ Fecha: $(date '+%d/%m/%Y %H:%M:%S')\n✅ No se encontraron transcodificaciones completadas hoy."
         return
     fi
 
+    # Conversión de bytes a GB
     local orig_gb
     orig_gb=$(awk "BEGIN { printf \"%.2f\", $espacio_original / 1073741824 }")
+
     local final_gb
     final_gb=$(awk "BEGIN { printf \"%.2f\", $espacio_final / 1073741824 }")
+
     local ahorrado_gb
     ahorrado_gb=$(awk "BEGIN { printf \"%.2f\", ($espacio_original - $espacio_final) / 1073741824 }")
 
+    # Cálculo de porcentaje de ahorro
     local ahorro_total
     ahorro_total=$(awk "BEGIN {
         if ($espacio_original > 0) {
@@ -595,14 +629,19 @@ enviar_informe_diario() {
         }
     }")
 
-    local informe="📊 *Informe diario*\n"
-    informe+="🗓️ Fecha: $(date '+%d/%m/%Y %H:%M:%S')\n"
-    informe+="✅ Archivos transcodificados hoy: ${archivos_transcodificados}\n"
-    informe+="📏 Tamaño original total: ${orig_gb} GB\n"
-    informe+="📏 Tamaño final total: ${final_gb} GB\n"
-    informe+="💾 Espacio ahorrado: ${ahorrado_gb} GB\n"
-    informe+="🔻 Ahorro total: ${ahorro_total}%"
+    local ahora
+    ahora=$(date '+%d/%m/%Y %H:%M:%S')
 
+    # Construimos el mensaje
+    local informe="📊 *Informe diario*\n"
+    informe+="🗓️ *Fecha:* $ahora\n"
+    informe+="✅ *Archivos transcodificados hoy:* ${archivos_transcodificados}\n"
+    informe+="📏 *Tamaño original total:* ${orig_gb} GB\n"
+    informe+="📏 *Tamaño final total:* ${final_gb} GB\n"
+    informe+="💾 *Espacio ahorrado:* ${ahorrado_gb} GB\n"
+    informe+="🔻 *Ahorro total:* ${ahorro_total}%\n"
+
+    # Envío del informe
     enviar_telegram "$informe"
 }
 
@@ -641,6 +680,7 @@ verificar_dependencias
 mkdir -p "$LOG_DIR" "$BACKUP_DIR"
 touch "$LOG_FILE"
 chmod 644 "$LOG_FILE"
+
 touch "$LOCKFILE"
 chmod 600 "$LOCKFILE"
 
