@@ -91,7 +91,7 @@
 
 ### 1. Escaneo y Transcodificación
 
-Supongamos que tienes una carpeta `/media/tranquilamami/Disco1/MisPeliculas` con los siguientes archivos:
+Supongamos que tienes una carpeta `/media/roger/Disco1/MisPeliculas` con los siguientes archivos:
 
 ```
 - ElPadrino.mkv (H.264, bitrate alto)
