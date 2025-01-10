@@ -2,7 +2,7 @@
 
 ##############################################################################
 # Ver el progreso:
-#   tail -f /home/tranquilamami/codeccrusher_logs/transcode.log
+#   tail -f /home/roger/codeccrusher_logs/transcode.log
 #
 # Parar el servicio:
 #   sudo systemctl stop codeccrusher.service
@@ -18,18 +18,18 @@ terminando=0  # Variable global para controlar la terminación
 ##############################################################################
 # Directorios a escanear
 RUTAS=(
-    "/media/tranquilamami/Disco1"
-    "/media/tranquilamami/Disco3"
-    "/media/tranquilamami/Disco4"
+    "/media/roger/Disco1"
+    "/media/roger/Disco3"
+    "/media/roger/Disco4"
     "/mnt/D10TB"
 )
 
 # Mapeo de las rutas a los discos
 declare -A discos
 discos=(
-    ["/media/tranquilamami/Disco1"]="Disco 1"
-    ["/media/tranquilamami/Disco3"]="Disco 3"
-    ["/media/tranquilamami/Disco4"]="Disco 4"
+    ["/media/roger/Disco1"]="Disco 1"
+    ["/media/roger/Disco3"]="Disco 3"
+    ["/media/roger/Disco4"]="Disco 4"
     ["/mnt/D10TB"]="D10TB"
 )
 
