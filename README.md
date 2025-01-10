@@ -196,7 +196,7 @@ sudo systemctl start codeccrusher.service
 ```
 - **Ver progreso**:
   ```bash
-  tail -f /home/tranquilamami/codeccrusher_logs/transcode.log
+  tail -f /home/roger/codeccrusher_logs/transcode.log
   ```
 - **Parar** el servicio:
   ```bash
